@@ -74,6 +74,6 @@ var harvestCmd = &cobra.Command{
 
 func init() {
 	harvestCmd.Flags().StringSliceVar(&extensions, "ext",
-		[]string{"avi", "mp4", "mkv", "wmv"},
+		[]string{"avi", "mp4", "mkv", "wmv", "smi", "srt"},
 		"List of extensions to harvest")
 }
