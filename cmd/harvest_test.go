@@ -27,6 +27,8 @@ func TestHarvestCmd(t *testing.T) {
 		filepath.Join(subDir, "file1.avi"),
 		filepath.Join(subDir, "file2.mp4"),
 		filepath.Join(subDir, "file3.txt"),
+		filepath.Join(subDir, "file4.AVI"),
+		filepath.Join(subDir, "file5.MP4"),
 	}
 
 	for _, file := range files {
@@ -48,6 +50,8 @@ func TestHarvestCmd(t *testing.T) {
 	expectedFiles := []string{
 		filepath.Join(tempDir, "file1.avi"),
 		filepath.Join(tempDir, "file2.mp4"),
+		filepath.Join(tempDir, "file4.AVI"),
+		filepath.Join(tempDir, "file5.MP4"),
 	}
 
 	for _, file := range expectedFiles {

@@ -39,7 +39,7 @@ var harvestCmd = &cobra.Command{
 			}
 			if !d.IsDir() && filepath.Dir(path) != workDir {
 				for _, ext := range extensions {
-					if filepath.Ext(path) == "."+ext {
+					if strings.EqualFold(filepath.Ext(path), "."+ext) {
 						destPath := filepath.Join(workDir, d.Name())
 						if _, err := os.Stat(destPath); err == nil {
 							base := strings.TrimSuffix(d.Name(), filepath.Ext(d.Name()))
