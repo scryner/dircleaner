@@ -66,3 +66,61 @@ func TestHarvestCmd(t *testing.T) {
 		t.Errorf("Expected file %s to not be moved, but it exists", nonExpectedFile)
 	}
 }
+
+func TestHarvestCmdWithClean(t *testing.T) {
+	// Create a temporary directory
+	tempDir, err := os.MkdirTemp("", "harvest_test_clean")
+	if err != nil {
+		t.Fatalf("Failed to create temp directory: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	// Create subdirectories and files
+	subDir := filepath.Join(tempDir, "subdir")
+	err = os.Mkdir(subDir, 0755)
+	if err != nil {
+		t.Fatalf("Failed to create subdir: %v", err)
+	}
+
+	files := []string{
+		filepath.Join(subDir, "file1.avi"),
+		filepath.Join(subDir, "file2.mp4"),
+	}
+
+	for _, file := range files {
+		f, err := os.Create(file)
+		if err != nil {
+			t.Fatalf("Failed to create file %s: %v", file, err)
+		}
+		f.Close()
+	}
+
+	// Run the harvest command with clean option
+	cmd := &cobra.Command{}
+	cmd.Flags().StringSliceVar(&extensions, "ext", []string{"avi", "mp4"}, "List of extensions to harvest")
+	cmd.Flags().BoolVar(&clean, "clean", true, "Clean up empty directories")
+	args := []string{tempDir}
+	cmd.SetArgs(args)
+
+	err = harvestCmd.RunE(cmd, args)
+	if err != nil {
+		t.Fatalf("Failed to run harvest command: %v", err)
+	}
+
+	// Check if the files are moved correctly
+	expectedFiles := []string{
+		filepath.Join(tempDir, "file1.avi"),
+		filepath.Join(tempDir, "file2.mp4"),
+	}
+
+	for _, file := range expectedFiles {
+		if _, err := os.Stat(file); os.IsNotExist(err) {
+			t.Errorf("Expected file %s not found", file)
+		}
+	}
+
+	// Check if the subdirectory is deleted
+	if _, err := os.Stat(subDir); !os.IsNotExist(err) {
+		t.Errorf("Expected subdir %s to be deleted", subDir)
+	}
+}

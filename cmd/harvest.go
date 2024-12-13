@@ -9,7 +9,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var extensions []string
+var (
+	clean      bool
+	extensions []string
+)
 
 var harvestCmd = &cobra.Command{
 	Use:   "harvest",
@@ -33,14 +36,19 @@ var harvestCmd = &cobra.Command{
 		fmt.Println("Harvesting files in directory: ", workDir)
 		fmt.Println("Harvesting files with extensions: ", extensions)
 
+		deletingDirs := make(map[string]bool)
+
 		err = filepath.WalkDir(workDir, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
+
 			if !d.IsDir() && filepath.Dir(path) != workDir {
 				for _, ext := range extensions {
 					if strings.EqualFold(filepath.Ext(path), "."+ext) {
 						destPath := filepath.Join(workDir, d.Name())
+
+						// check if the file already exists
 						if _, err := os.Stat(destPath); err == nil {
 							base := strings.TrimSuffix(d.Name(), filepath.Ext(d.Name()))
 							ext := filepath.Ext(d.Name())
@@ -54,6 +62,12 @@ var harvestCmd = &cobra.Command{
 								i++
 							}
 						}
+
+						// extract the directory
+						dir := filepath.Dir(path)
+						deletingDirs[dir] = true
+
+						// moving the file
 						fmt.Printf("Moving file %s to %s\n", path, destPath)
 						err := os.Rename(path, destPath)
 						if err != nil {
@@ -68,6 +82,17 @@ var harvestCmd = &cobra.Command{
 			return fmt.Errorf("error harvesting files: %v", err)
 		}
 
+		if clean {
+			for deletingDir := range deletingDirs {
+				fmt.Println("Deleting directory: ", deletingDir)
+
+				err := os.RemoveAll(deletingDir)
+				if err != nil {
+					fmt.Printf("Warning: failed to delete directory %s: %v\n", deletingDir, err)
+				}
+			}
+		}
+
 		return nil
 	},
 }
@@ -76,4 +101,5 @@ func init() {
 	harvestCmd.Flags().StringSliceVar(&extensions, "ext",
 		[]string{"avi", "mp4", "mkv", "wmv", "smi", "srt"},
 		"List of extensions to harvest")
+	harvestCmd.Flags().BoolVar(&clean, "clean", false, "Clean up empty directories")
 }
