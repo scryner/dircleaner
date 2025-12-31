@@ -1,0 +1,376 @@
+package cmd
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"fmt"
+	"math"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/spf13/cobra"
+)
+
+var (
+	depth int
+)
+
+var transcodeCmd = &cobra.Command{
+	Use:   "transcode",
+	Short: "Transcode large mp4 files to h.265",
+	Long:  `Recursively find mp4 files (>100MB) and transcode them to h.265 if they are not already.`,
+	RunE:  runTranscode,
+}
+
+func init() {
+	transcodeCmd.Flags().IntVarP(&depth, "depth", "d", 5, "maximum depth to traverse")
+}
+
+func runTranscode(cmd *cobra.Command, args []string) error {
+	// Setup context with cancellation on signal
+	ctx, cancel := context.WithCancel(cmd.Context())
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		cancel()
+	}()
+
+	targets := args
+	if len(targets) == 0 {
+		wd, err := os.Getwd()
+		if err != nil {
+			return fmt.Errorf("failed to get current working directory: %w", err)
+		}
+		targets = []string{wd}
+	}
+
+	for _, target := range targets {
+		info, err := os.Stat(target)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error accessing %s: %v\n", target, err)
+			continue
+		}
+
+		if !info.IsDir() {
+			// Process single file
+			if strings.ToLower(filepath.Ext(target)) != ".mp4" {
+				continue
+			}
+			if info.Size() < 100*1024*1024 {
+				continue
+			}
+			if isH265(target) {
+				fmt.Printf("Skipping %s: already h.265\n", target)
+				continue
+			}
+
+			fmt.Printf("Transcoding %s...\n", target)
+			ch, err := transcodeFile(ctx, target)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to initiate transcode for %s: %v\n", target, err)
+				continue
+			}
+
+			// Simple progress consumer
+			for evt := range ch {
+				if evt.err != nil {
+					fmt.Fprintf(os.Stderr, "Error transcoding %s: %v\n", target, evt.err)
+					break
+				}
+				if evt.done {
+					// Success! Replace file
+					ext := filepath.Ext(target)
+					base := target[:len(target)-len(ext)]
+					outputPath := base + ".h265.mp4"
+
+					// Restore modification time
+					if err := os.Chtimes(outputPath, info.ModTime(), info.ModTime()); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: failed to restore mtime for %s: %v\n", outputPath, err)
+					}
+
+					// Remove input file
+					if err := os.Remove(target); err != nil {
+						fmt.Fprintf(os.Stderr, "Failed to remove input file %s: %v\n", target, err)
+						break
+					}
+
+					// Rename output to input
+					if err := os.Rename(outputPath, target); err != nil {
+						fmt.Fprintf(os.Stderr, "Failed to rename output file %s: %v\n", outputPath, err)
+						break
+					}
+					fmt.Println("Done.")
+				}
+				// We can optionally print progress percentage here if needed,
+				// but user asked to remove "all code related to progress bar",
+				// so keeping it minimal.
+			}
+			continue
+		}
+
+		// It's a directory, walk it
+		root, err := filepath.Abs(target)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error resolving path %s: %v\n", target, err)
+			continue
+		}
+
+		err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+
+			// Calculate depth relative to the target root
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return err
+			}
+
+			if rel == "." {
+				return nil
+			}
+
+			depthCount := strings.Count(rel, string(os.PathSeparator)) + 1
+			if d.IsDir() {
+				if depthCount > depth {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+
+			if strings.ToLower(filepath.Ext(path)) != ".mp4" {
+				return nil
+			}
+
+			if info.Size() < 100*1024*1024 { // 100MB
+				return nil
+			}
+
+			// Check if already h.265
+			if isH265(path) {
+				fmt.Printf("Skipping %s: already h.265\n", path)
+				return nil
+			}
+
+			fmt.Printf("Transcoding %s...\n", path)
+
+			ch, err := transcodeFile(ctx, path)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to initiate transcode for %s: %v\n", path, err)
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				return nil
+			}
+
+			// Simple progress consumer
+			for evt := range ch {
+				if evt.err != nil {
+					fmt.Fprintf(os.Stderr, "Error transcoding %s: %v\n", path, evt.err)
+					break
+				}
+				if evt.done {
+					// Success! Replace file
+					ext := filepath.Ext(path)
+					base := path[:len(path)-len(ext)]
+					outputPath := base + ".h265.mp4"
+
+					// Restore modification time
+					if err := os.Chtimes(outputPath, info.ModTime(), info.ModTime()); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: failed to restore mtime for %s: %v\n", outputPath, err)
+					}
+
+					// Remove input file
+					if err := os.Remove(path); err != nil {
+						fmt.Fprintf(os.Stderr, "Failed to remove input file %s: %v\n", path, err)
+						break
+					}
+
+					// Rename output to input
+					if err := os.Rename(outputPath, path); err != nil {
+						fmt.Fprintf(os.Stderr, "Failed to rename output file %s: %v\n", outputPath, err)
+						break
+					}
+					fmt.Println("Done.")
+				}
+			}
+
+			return nil
+		})
+
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error walking directory %s: %v\n", target, err)
+		}
+	}
+
+	return nil
+}
+
+func isH265(path string) bool {
+	cmd := exec.Command("ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", path)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Run(); err != nil {
+		return false
+	}
+	return strings.TrimSpace(out.String()) == "hevc"
+}
+
+type transcodeEvent struct {
+	done     bool
+	progress float64
+	total    float64
+	err      error
+}
+
+func transcodeFile(ctx context.Context, inputPath string) (<-chan transcodeEvent, error) {
+	// Initial checks and setup
+	_, err := os.Stat(inputPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat input file: %w", err)
+	}
+
+	ext := filepath.Ext(inputPath)
+	base := inputPath[:len(inputPath)-len(ext)]
+	outputPath := base + ".h265.mp4"
+
+	// Get input duration for verification and progress calculation
+	inputDuration, err := getDuration(inputPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get input duration: %w", err)
+	}
+
+	ch := make(chan transcodeEvent)
+
+	go func() {
+		defer close(ch)
+
+		// Create command
+		// ffmpeg -i "$INPUT_FILE" \
+		//   -c:v hevc_videotoolbox \
+		//   -q:v 65 \
+		//   -tag:v hvc1 \
+		//   -c:a aac -b:a 192k \
+		//   "$OUTPUT_FILE"
+		cmd := exec.CommandContext(ctx, "ffmpeg", "-i", inputPath,
+			"-c:v", "hevc_videotoolbox",
+			"-q:v", "65",
+			"-tag:v", "hvc1",
+			"-c:a", "aac", "-b:a", "192k",
+			"-progress", "pipe:2",
+			"-nostats",
+			"-y",
+			outputPath)
+
+		stderr, err := cmd.StderrPipe()
+		if err != nil {
+			ch <- transcodeEvent{err: fmt.Errorf("failed to get stderr pipe: %w", err)}
+			return
+		}
+
+		if err := cmd.Start(); err != nil {
+			ch <- transcodeEvent{err: fmt.Errorf("failed to start ffmpeg: %w", err)}
+			return
+		}
+
+		// Ensure cleanup
+		var success bool
+		defer func() {
+			if !success {
+				os.Remove(outputPath)
+			}
+		}()
+
+		// Progress parsing
+		scanner := bufio.NewScanner(stderr)
+		scanner.Split(bufio.ScanLines)
+		timeRegex := regexp.MustCompile(`out_time=(\d+):(\d+):(\d+(?:\.\d+)?)`)
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			if matches := timeRegex.FindStringSubmatch(line); matches != nil {
+				current := parseDurationComponents(matches[1], matches[2], matches[3])
+				progress := current.Seconds() / inputDuration
+				if progress > 1.0 {
+					progress = 1.0
+				}
+
+				// Send progress
+				// Non-blocking send isn't strictly necessary with a dedicated goroutine per file
+				// but user wants progress channel communication.
+				// We should just block as the consumer is likely reading from it.
+				// However, if consumer stops reading, we might block.
+				// But we are in a goroutine that is dedicated to this task.
+				// If we want to support cancellation, we should select on ctx.Done() too.
+				select {
+				case ch <- transcodeEvent{progress: progress, total: 1.0}:
+				case <-ctx.Done():
+					// Context canceled, process likely killed by cmd.Wait() or will be.
+					return
+				}
+			}
+		}
+
+		if err := cmd.Wait(); err != nil {
+			ch <- transcodeEvent{err: fmt.Errorf("ffmpeg execution failed: %w", err)}
+			return
+		}
+
+		// Verify Output
+		outputDuration, err := getDuration(outputPath)
+		if err != nil {
+			ch <- transcodeEvent{err: fmt.Errorf("failed to get output duration: %w", err)}
+			return
+		}
+
+		diff := math.Abs(inputDuration - outputDuration)
+		if diff > 1.0 {
+			ch <- transcodeEvent{err: fmt.Errorf("duration mismatch: input=%.2fs, output=%.2fs", inputDuration, outputDuration)}
+			return
+		}
+
+		// We do NOT replace files here anymore.
+		// That is the caller's responsibility.
+		// Use strictly only for verification logic that determines "success" of transcoding.
+
+		success = true
+		ch <- transcodeEvent{done: true, progress: 1.0, total: 1.0}
+	}()
+
+	return ch, nil
+}
+
+func getDuration(path string) (float64, error) {
+	cmd := exec.Command("ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", path)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, err
+	}
+	val := strings.TrimSpace(string(out))
+	return strconv.ParseFloat(val, 64)
+}
+
+func parseDurationComponents(h, m, s string) time.Duration {
+	hours, _ := strconv.Atoi(h)
+	minutes, _ := strconv.Atoi(m)
+	seconds, _ := strconv.ParseFloat(s, 64)
+	return time.Duration(hours)*time.Hour +
+		time.Duration(minutes)*time.Minute +
+		time.Duration(seconds*float64(time.Second))
+}
