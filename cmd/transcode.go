@@ -23,8 +23,11 @@ import (
 )
 
 var (
-	depth       int
-	concurrency int
+	depth        int
+	concurrency  int
+	preserve     bool
+	minSizeStr   string
+	minSizeBytes int64
 )
 
 var transcodeCmd = &cobra.Command{
@@ -57,6 +60,12 @@ var transcodeCmd = &cobra.Command{
 			return err
 		}
 
+		var parseErr error
+		minSizeBytes, parseErr = parseSize(minSizeStr)
+		if parseErr != nil {
+			return fmt.Errorf("invalid min-size: %w", parseErr)
+		}
+
 		return runTranscode(ctx, plan)
 	},
 }
@@ -64,6 +73,8 @@ var transcodeCmd = &cobra.Command{
 func init() {
 	transcodeCmd.Flags().IntVarP(&depth, "depth", "d", 5, "maximum depth to traverse")
 	transcodeCmd.Flags().IntVarP(&concurrency, "concurrency", "j", 1, "maximum number of concurrent transcoding jobs")
+	transcodeCmd.Flags().BoolVarP(&preserve, "preserve", "p", false, "preserve original file")
+	transcodeCmd.Flags().StringVarP(&minSizeStr, "min-size", "m", "100mb", "minimum file size to process")
 }
 
 func isH265(path string) (bool, error) {
@@ -114,12 +125,18 @@ func transcodeFile(ctx context.Context, inputPath string) (<-chan transcodeEvent
 		//   -tag:v hvc1 \
 		//   -c:a aac -b:a 192k \
 		//   "$OUTPUT_FILE"
-		cmd := exec.CommandContext(ctx, "ffmpeg", "-i", inputPath,
+		cmd := exec.CommandContext(ctx, "ffmpeg",
+			"-hwaccel", "videotoolbox",
+			"-i", inputPath,
+			// "-vf", "format=nv12",
 			"-c:v", "hevc_videotoolbox",
+			"-c:a", "copy",
+			// "-b:v", "6000k",
 			"-q:v", "65",
+			"-allow_sw", "0",
 			"-tag:v", "hvc1",
-			"-c:a", "aac", "-b:a", "192k",
 			"-progress", "pipe:2",
+			"-stats_period", "0.5",
 			"-nostats",
 			"-y",
 			outputPath)
@@ -209,6 +226,35 @@ func parseDurationComponents(h, m, s string) time.Duration {
 	return time.Duration(hours)*time.Hour +
 		time.Duration(minutes)*time.Minute +
 		time.Duration(seconds*float64(time.Second))
+}
+
+func parseSize(s string) (int64, error) {
+	s = strings.TrimSpace(strings.ToLower(s))
+	if s == "" {
+		return 0, fmt.Errorf("empty size string")
+	}
+
+	var multiplier int64 = 1
+	if strings.HasSuffix(s, "kb") {
+		multiplier = 1024
+		s = strings.TrimSuffix(s, "kb")
+	} else if strings.HasSuffix(s, "mb") {
+		multiplier = 1024 * 1024
+		s = strings.TrimSuffix(s, "mb")
+	} else if strings.HasSuffix(s, "gb") {
+		multiplier = 1024 * 1024 * 1024
+		s = strings.TrimSuffix(s, "gb")
+	} else if strings.HasSuffix(s, "tb") {
+		multiplier = 1024 * 1024 * 1024 * 1024
+		s = strings.TrimSuffix(s, "tb")
+	}
+
+	val, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0, err
+	}
+
+	return int64(val * float64(multiplier)), nil
 }
 
 type transcodePlan struct {
@@ -310,7 +356,7 @@ func shouldProcess(path string, info os.FileInfo) bool {
 	if strings.HasSuffix(path, ".h265.mp4") {
 		return false
 	}
-	if info.Size() < 100*1024*1024 {
+	if minSizeBytes > 0 && info.Size() < minSizeBytes {
 		return false
 	}
 	isHevc, err := isH265(path)
@@ -345,6 +391,7 @@ func (e *ErrorTracker) Add(file string, err error) {
 
 func (e *ErrorTracker) PrintSummary() {
 	if len(e.errors) == 0 {
+		fmt.Println("\nTranscoding completed successfully.")
 		return
 	}
 	fmt.Printf("\nCompleted with %d errors:\n", len(e.errors))
@@ -399,22 +446,25 @@ func runTranscode(ctx context.Context, plan *transcodePlan) error {
 	}
 
 	// Monitor context cancellation to abort global bar
-	done := make(chan struct{})
+	monitorDone := make(chan struct{})
+	workDone := make(chan struct{})
 	go func() {
-		defer close(done)
+		defer close(monitorDone)
 		select {
 		case <-ctx.Done():
 			globalBar.Abort(true)
-		case <-done:
+		case <-workDone:
 		}
 	}()
 
 	wg.Wait()
+
 	if ctx.Err() != nil {
 		globalBar.Abort(true)
 	}
 	p.Wait()
-	<-done // wait for monitor to exit checks
+	close(workDone)
+	<-monitorDone // wait for monitor to exit checks
 	tracker.PrintSummary()
 	return nil
 }
@@ -502,6 +552,10 @@ func finalizeFile(target string) error {
 		// Let's just ignore the warning here as it's non-critical, or maybe return it?
 		// Original code just printed a warning.
 		// We'll leave it be for now but NOT print.
+	}
+
+	if preserve {
+		return nil
 	}
 
 	// Remove input file
